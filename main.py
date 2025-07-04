@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import time
 from typing import Dict, List, Tuple, Union, Optional
 
 import astrbot.api.message_components as Comp
@@ -9,12 +10,12 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 
-# 数据存储路径（遵循文档要求存储在data目录下）
+# 数据存储路径
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 USER_DATA_DIR = os.path.join(DATA_DIR, "shuati_user_data")
 
 
-@register("shuati", "xiazhimiao", "期末考试刷题插件（带错题本功能）", "1.5", "https://github.com/xiazhimiao/shuati")
+@register("shuati", "xiazhimiao", "期末考试刷题插件（带错题本功能）", "1.9", "https://github.com/xiazhimiao/shuati")
 class ShuatiPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -58,6 +59,28 @@ class ShuatiPlugin(Star):
         question = random.choice(q_list)
         return question, q_type
 
+    def _get_chapter_questions(self, chapter: str) -> List[Dict]:
+        """获取指定章节的所有题目（按存储顺序排列）"""
+        section = self.questions.get(chapter)
+        if not section:
+            return []
+        
+        # 合并单选和多选题，保持原始顺序
+        all_questions = []
+        for q_type in ["single", "multiple"]:
+            all_questions.extend(section.get(q_type, []))
+        return all_questions
+
+    def _get_question_by_index(self, chapter: str, index: int) -> Tuple[Dict, str]:
+        """按索引获取章节中的题目及题型"""
+        questions = self._get_chapter_questions(chapter)
+        if index < 0 or index >= len(questions):
+            return None, None
+        
+        question = questions[index]
+        q_type = "single" if len(question.get("answer", "")) == 1 else "multiple"
+        return question, q_type
+
     def _format_question(self, question: Dict, q_type: str) -> str:
         """格式化题目展示（修改多选题提示为空格分隔）"""
         opts = "\n".join([f"{key}. {val}" for key, val in question["options"].items()])
@@ -80,12 +103,12 @@ class ShuatiPlugin(Star):
             except Exception as e:
                 logger.error(f"加载用户 {user_id} 数据时出错: {e}")
         
-        # 初始化用户数据（新增错题提示标记）
+        # 初始化用户数据
         self.user_data[user_id] = {
             "wrong_questions": [],
             "total_questions": 0,
             "correct_questions": 0,
-            "showed_50_wrong_tip": False  # 新增：是否显示过50题提示
+            "showed_50_wrong_tip": False
         }
         return self.user_data[user_id]
 
@@ -206,7 +229,8 @@ class ShuatiPlugin(Star):
                 await ev.send(ev.plain_result(f"❌ 回答错误，正确答案是: {correct_ans}"))
                 # 添加错题到错题本（传递event参数）
                 self._add_wrong_question(user_id, question, chapter, q_type, ev)
-
+            
+            # 无论回答正确与否，处理完后立即终止会话
             controller.stop()
 
         try:
@@ -215,9 +239,94 @@ class ShuatiPlugin(Star):
             logger.error(f"答题时出错: {e}")
             yield event.plain_result("发生错误或超时，已退出刷题模式。")
 
+    @filter.command("顺序刷题")
+    async def order_quiz(self, event: AstrMessageEvent):
+        """按顺序刷题（格式：/顺序刷题 [章节编号] [题目序号]）"""
+        user_id = event.get_sender_id()
+        user_name = event.get_sender_name()
+        
+        # 从原始消息中提取参数（跳过命令部分）
+        command_prefix = "/顺序刷题"
+        full_msg = event.message_str
+        arg_str = full_msg[len(command_prefix):].strip()
+        logger.info(f"order_quiz 原始参数: {arg_str}")
+        
+        if not arg_str:
+            yield event.plain_result("请输入章节编号和题目序号（格式：/顺序刷题 [章节编号] [题目序号]）。")
+            return
+        
+        args = arg_str.split()
+        if len(args) != 2:
+            yield event.plain_result("参数格式错误，需输入章节编号和题目序号（如：/顺序刷题 0 5）。")
+            return
+        
+        try:
+            chapter_idx = int(args[0])
+            question_idx = int(args[1])
+        except (ValueError, TypeError):
+            yield event.plain_result("章节编号和题目序号必须为数字。")
+            return
+        
+        # 验证章节有效性
+        if chapter_idx < 0 or chapter_idx >= len(self.chapter_keys):
+            yield event.plain_result(f"章节编号无效（0-{len(self.chapter_keys)-1}），请输入 /shuati list 查看章节。")
+            return
+        
+        chapter = self.chapter_keys[chapter_idx]
+        questions = self._get_chapter_questions(chapter)
+        if not questions:
+            yield event.plain_result(f"章节“{chapter}”下没有题目数据。")
+            return
+        
+        # 验证题目序号有效性
+        if question_idx < 0 or question_idx >= len(questions):
+            yield event.plain_result(f"题目序号无效（0-{len(questions)-1}），该章节共有{len(questions)}道题。")
+            return
+        
+        question, q_type = self._get_question_by_index(chapter, question_idx)
+        if not question:
+            yield event.plain_result("获取题目失败，请重试。")
+            return
+        
+        await event.send(event.plain_result(f"📖 顺序刷题 - 章节：{chapter}，题目序号：{question_idx}\n" + 
+                                     self._format_question(question, q_type)))
+        
+        @session_waiter(timeout=90)
+        async def wait_answer(controller: SessionController, ev: AstrMessageEvent):
+            user_answer = ev.message_str.strip().upper().replace("，", " ")  # 统一替换为空格
+            is_correct = False
+
+            if q_type == "single":
+                is_correct = user_answer == question["answer"]
+            elif q_type == "multiple":
+                correct = set(question["answer"])
+                given = set([x.strip() for x in user_answer.split() if x.strip()])
+                is_correct = given == correct
+
+            if is_correct:
+                await ev.send(ev.plain_result("✅ 回答正确！"))
+                user_data = self._get_user_data(user_id)
+                user_data["correct_questions"] += 1
+                self._save_user_data(user_id)
+            else:
+                # 多选题正确答案用空格连接展示
+                correct_ans = " ".join(question["answer"]) if q_type == "multiple" else question["answer"]
+                await ev.send(ev.plain_result(f"❌ 回答错误，正确答案是: {correct_ans}"))
+                # 添加错题到错题本
+                self._add_wrong_question(user_id, question, chapter, q_type, ev)
+            
+            # 无论回答正确与否，处理完后立即终止会话
+            controller.stop()
+
+        try:
+            await wait_answer(event)
+        except Exception as e:
+            logger.error(f"顺序刷题时出错: {e}")
+            yield event.plain_result("发生错误或超时，已退出顺序刷题模式。")
+
     @filter.command("wrong")
     async def practice_wrong_questions(self, event: AstrMessageEvent, arg: Union[str, None] = None):
-        """从错题本中练习题目（支持查看错题列表）"""
+        """从错题本练习题目（支持查看错题列表）"""
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
         await self._show_or_practice_wrong_questions(event, user_id, user_name, show_only=(arg == "list"))
@@ -276,7 +385,8 @@ class ShuatiPlugin(Star):
                 await ev.send(ev.plain_result(f"❌ 回答错误，正确答案是: {correct_ans}，需要继续复习哦～"))
                 # 添加错题到错题本（传递event参数）
                 self._add_wrong_question(user_id, question, chapter, q_type, ev)
-
+            
+            # 无论回答正确与否，处理完后立即终止会话
             controller.stop()
 
         try:
@@ -312,28 +422,23 @@ class ShuatiPlugin(Star):
         📚 刷题插件帮助指南 📚
         
         一、插件基本逻辑
-        1. 支持按章节随机刷题，自动记录错题到错题本
+        1. 支持按章节随机刷题和顺序刷题
         2. 单选题直接输入选项（如A），多选题用空格分隔选项（如A B）
         3. 错题本支持针对性复习，答对后自动移除已掌握题目
         
         二、常用指令
-        /shuati [章节编号]       开始指定章节刷题
+        /shuati [章节编号]       开始指定章节随机刷题
+        /顺序刷题 [章节编号] [题目序号] 按顺序刷指定章节的题目
         /shuati list            查看所有可用章节
         /wrong                  从错题本练习
         /wrong list             查看错题列表
         /stats                  查看刷题统计数据
         
-        三、刷题统计说明
-        当前统计功能尚不完善，主要局限包括：
-        1. 数据仅本地存储，未支持多设备同步
-        2. 缺乏按章节/题型的详细分类统计
-        3. 未实现学习进度可视化展示
-        4. 暂不支持智能错题推荐复习
-        
-        四、使用建议
-        1. 建议定期使用/wrong指令复习错题
-        2. 若错题集达50题会自动提醒，及时进行针对性练习
-        3. 刷题过程中遇到问题可联系插件作者反馈
+        三、顺序刷题说明
+        1. 格式：/顺序刷题 [章节编号] [题目序号]
+        2. 章节编号从0开始，可通过 /shuati list 查看
+        3. 题目序号从0开始，代表章节内题目的存储顺序
+        4. 若题目序号超出范围，将提示该章节的题目总数
         """
         yield event.plain_result(help_msg.strip())
 
